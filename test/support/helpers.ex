@@ -71,40 +71,61 @@ defmodule KlifeProtocol.TestSupport.Helpers do
     :ok
   end
 
-  def initialize_connections("SSL") do
-    ssl_opts = [
-      verify: :verify_peer,
-      cacertfile: Path.relative("test/compose_files/ssl/ca.crt")
-    ]
-
-    socket_backend = :ssl
-    opts = [backend: socket_backend, active: false] ++ ssl_opts
-
-    Enum.each(@default_brokers_ssl, fn {broker_id, hostname} ->
-      [host, port] = String.split(hostname, ":")
-      result = Socket.connect(host, String.to_integer(port), opts)
-      write_to_shared(broker_id, {socket_backend, result})
+  # Tests run concurrently, so sharing one socket per broker lets requests and
+  # responses of different tests interleave. Instead each process lazily opens
+  # its own connection to a broker, which is closed when the process exits.
+  # This only checks upfront that every broker is reachable.
+  def initialize_connections(conn_mode) do
+    conn_mode
+    |> brokers()
+    |> Enum.each(fn {broker_id, _hostname} ->
+      {backend, socket} = connect(conn_mode, broker_id)
+      :ok = backend.close(socket)
     end)
   end
 
-  def initialize_connections(nil) do
-    socket_backend = :gen_tcp
-    opts = [backend: socket_backend, active: false]
+  defp brokers(nil), do: @default_brokers
+  defp brokers("SSL"), do: @default_brokers_ssl
 
-    Enum.each(@default_brokers, fn {broker_id, hostname} ->
-      [host, port] = String.split(hostname, ":")
-      result = Socket.connect(host, String.to_integer(port), opts)
-      write_to_shared(broker_id, {socket_backend, result})
-    end)
-  end
-
-  def initialize_connections(unknown_conn_mode) do
+  defp brokers(unknown_conn_mode) do
     raise """
     Unkown CONN_MODE env var.
 
     Expected: SSL
     Found: #{unknown_conn_mode}
     """
+  end
+
+  defp connect(conn_mode, broker) do
+    [host, port] = conn_mode |> brokers() |> Map.fetch!(broker) |> String.split(":")
+    opts = socket_opts(conn_mode)
+    {:ok, socket} = Socket.connect(host, String.to_integer(port), opts)
+    {opts[:backend], socket}
+  end
+
+  defp socket_opts("SSL") do
+    [
+      backend: :ssl,
+      active: false,
+      verify: :verify_peer,
+      cacertfile: Path.relative("test/compose_files/ssl/ca.crt")
+    ]
+  end
+
+  defp socket_opts(nil), do: [backend: :gen_tcp, active: false]
+
+  defp get_connection(broker) do
+    key = {:broker_connection, broker}
+
+    case Process.get(key) do
+      nil ->
+        conn = connect(System.get_env("CONN_MODE"), broker)
+        Process.put(key, conn)
+        conn
+
+      conn ->
+        conn
+    end
   end
 
   def write_to_shared(key, val), do: :ets.insert(:shared_storage, {key, val})
@@ -127,14 +148,11 @@ defmodule KlifeProtocol.TestSupport.Helpers do
       |> Enum.random()
       |> elem(0)
 
-    {backend, {:ok, socket}} = read_from_shared(broker)
-    :ok = backend.send(socket, data)
-    {:ok, response} = backend.recv(socket, 0, 5_000)
-    response
+    send_message_to_broker(data, broker)
   end
 
   def send_message_to_broker(data, broker) do
-    {backend, {:ok, socket}} = read_from_shared(broker)
+    {backend, socket} = get_connection(broker)
     :ok = backend.send(socket, data)
     {:ok, response} = backend.recv(socket, 0, 5_000)
     response
